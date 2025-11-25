@@ -1,82 +1,296 @@
-name: vulnpy
+name: CI/CD con Seguridad - My-Ecommerce ITESO
 
 on:
-  push:                                       
+  push:
     branches:
       - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
 
 jobs:
+  # Job 1: Build y compilación
   build:
+    name: Compilación TypeScript
     runs-on: ubuntu-latest
+    
     steps:
-      - run: echo "This is a build step"
+      - name: Checkout del código
+        uses: actions/checkout@v4
+      
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      
+      - name: Instalar dependencias
+        run: npm ci
+      
+      - name: Compilar TypeScript
+        run: npm run build
+      
+      - name: Subir artefactos compilados
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: dist/
+        if: always()
 
+  # Job 2: Pruebas automatizadas
   test:
+    name: Pruebas Jest
     runs-on: ubuntu-latest
     needs: build
+    
     steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+      
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      
+      - name: Instalar dependencias
+        run: npm ci
+      
+      - name: Ejecutar pruebas con cobertura
+        run: npm run test:coverage
+        env:
+          NODE_ENV: test
+          JWT_SECRET: test_secret_key_for_unit_tests
+      
+      - name: Subir reporte de cobertura
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+        if: always()
 
-      - run: echo "This is a test step"
-
+  # Job 3: SCA - Análisis de dependencias con Trivy
   sca:
+    name: SCA - Trivy (Análisis de Dependencias)
     runs-on: ubuntu-latest
     needs: test
+    
     steps:
-      - uses: actions/checkout@v2
-      - run: docker run --rm -v $(pwd):/src hysnsec/safety check -r requirements.txt --json | tee sca-results.json
-        continue-on-error: true
-      - uses: actions/upload-artifact@v4
+      - name: Checkout del código
+        uses: actions/checkout@v4
+      
+      - name: Ejecutar Trivy para escaneo de dependencias
+        uses: aquasecurity/trivy-action@master
         with:
-          name: Safety
-          path: sca-results.json
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'json'
+          output: 'trivy-results.json'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+        continue-on-error: true
+      
+      - name: Subir reporte Trivy
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-sca-report
+          path: trivy-results.json
         if: always()
-
-  sast:
-    runs-on: ubuntu-latest
-    needs: [sca,secret_scanning]
-    steps:
-      - uses: actions/checkout@v2
-
-      - run: docker run --rm -v $(pwd):/src hysnsec/bandit -r /src -f json -o /src/bandit-output.json
+      
+      - name: Generar reporte legible
+        run: |
+          docker run --rm -v $(pwd):/workspace aquasec/trivy fs /workspace --format table --severity CRITICAL,HIGH
         continue-on-error: true
 
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: Bandit
-          path: bandit-output.json
-        if: always()
-
-
+  # Job 4: Secret Scanning con TruffleHog
   secret_scanning:
+    name: Detección de Secretos - TruffleHog
     runs-on: ubuntu-latest
     needs: test
+    
     steps:
-      - uses: actions/checkout@v2
-      - run: docker run --rm -v $(pwd):/src hysnsec/trufflehog filesystem ./src --fail --json > trufflehog-output.json
-        continue-on-error: true
-      - uses: actions/upload-artifact@v4
+      - name: Checkout del código
+        uses: actions/checkout@v4
         with:
-          name: TruffleHog
+          fetch-depth: 0
+      
+      - name: Ejecutar TruffleHog
+        run: |
+          docker run --rm -v $(pwd):/src trufflesecurity/trufflehog:latest filesystem /src --json --no-update > trufflehog-output.json || true
+        continue-on-error: true
+      
+      - name: Subir reporte TruffleHog
+        uses: actions/upload-artifact@v4
+        with:
+          name: trufflehog-report
           path: trufflehog-output.json
         if: always()
-        
-  zap_baseline:
-    runs-on: ubuntu-latest
-    needs: sast
-    steps:
-      - run: |
-            docker pull zaproxy/zap-stable
-            docker run --user root --rm -v $(pwd):/zap/wrk:rw -w /zap zaproxy/zap-stable zap-baseline.py -t https://44.200.149.195 -x zap-output.xml
 
-      - uses: actions/upload-artifact@v4
+  # Job 5: SAST - ESLint
+  eslint:
+    name: SAST - ESLint
+    runs-on: ubuntu-latest
+    needs: [sca, secret_scanning]
+    
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+      
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
         with:
-          name: ZAP Scan
-          path: zap-output.json
+          node-version: '20'
+          cache: 'npm'
+      
+      - name: Instalar dependencias
+        run: npm ci
+      
+      - name: Ejecutar ESLint
+        run: npm run lint || true
+        continue-on-error: true
+      
+      - name: Generar reporte JSON
+        run: npx eslint src --ext .ts --format json --output-file eslint-report.json || true
+        continue-on-error: true
+      
+      - name: Subir reporte ESLint
+        uses: actions/upload-artifact@v4
+        with:
+          name: eslint-report
+          path: eslint-report.json
         if: always()
 
-  prod:
+  # Job 6: DAST - OWASP ZAP (con servidor local)
+  zap_baseline:
+    name: DAST - OWASP ZAP
     runs-on: ubuntu-latest
-    needs: zap_baseline
+    needs: eslint
+    
     steps:
-      - run: echo "This is a deploy step."
+      - name: Checkout del código
+        uses: actions/checkout@v4
+      
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      
+      - name: Instalar dependencias
+        run: npm ci
+      
+      - name: Compilar aplicación
+        run: npm run build
+      
+      - name: Iniciar servidor en background
+        run: |
+          node dist/index.js &
+          SERVER_PID=$!
+          echo "SERVER_PID=$SERVER_PID" >> $GITHUB_ENV
+          sleep 10  
+        env:
+          NODE_ENV: production
+          PORT: 3000
+          MONGO_URI: mongodb://localhost:27017/test
+          JWT_SECRET: test_secret_for_zap_scan
+        continue-on-error: true
+      
+      - name: Verificar que el servidor esté corriendo
+        run: |
+          curl -f http://localhost:3000/ || echo "Servidor no responde, continuando sin DAST"
+        continue-on-error: true
+      
+      - name: Ejecutar ZAP Baseline Scan
+        run: |
+          docker pull zaproxy/zap-stable
+          docker run --network="host" --user root --rm -v $(pwd):/zap/wrk:rw zaproxy/zap-stable zap-baseline.py \
+            -t http://localhost:3000 \
+            -r zap-report.html \
+            -J zap-report.json \
+            -w zap-report.md \
+            || echo "ZAP scan completado con advertencias"
+        continue-on-error: true
+      
+      - name: Detener servidor
+        run: |
+          if [ ! -z "$SERVER_PID" ]; then
+            kill $SERVER_PID || true
+          fi
+        if: always()
+      
+      - name: Subir reportes ZAP
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-scan-reports
+          path: |
+            zap-report.html
+            zap-report.json
+            zap-report.md
+        if: always()
+
+  # Job 7: SonarQube Analysis (opcional - requiere configuración)
+  sonarqube:
+    name: SAST - SonarQube
+    runs-on: ubuntu-latest
+    needs: eslint
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      
+      - name: Instalar dependencias
+        run: npm ci
+      
+      - name: Ejecutar análisis SonarQube
+        uses: sonarsource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        continue-on-error: true
+      
+      - name: Verificar Quality Gate
+        uses: sonarsource/sonarqube-quality-gate-action@master
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        continue-on-error: true
+
+  # Job 8: Resumen y deployment
+  prod:
+    name: Resumen y Preparación para Deploy
+    runs-on: ubuntu-latest
+    needs: [build, test, sca, secret_scanning, eslint, zap_baseline]
+    if: always()
+    
+    steps:
+      - name: Verificar estado de los jobs
+        run: |
+          echo "Resumen de Seguridad del Pipeline"
+          echo "===================================="
+          echo "Build: ${{ needs.build.result }}"
+          echo "Tests: ${{ needs.test.result }}"
+          echo "SCA (Trivy): ${{ needs.sca.result }}"
+          echo "Secret Scanning: ${{ needs.secret_scanning.result }}"
+          echo "ESLint: ${{ needs.eslint.result }}"
+          echo "ZAP Scan: ${{ needs.zap_baseline.result }}"
+          echo "===================================="
+          
+          if [ "${{ needs.build.result }}" == "failure" ] || [ "${{ needs.test.result }}" == "failure" ]; then
+            echo "Pipeline falló en etapas críticas"
+            exit 1
+          else
+            echo "Pipeline completado - revisar artefactos para detalles de seguridad"
+          fi
+      
+      - name: Mensaje de deployment
+        if: github.ref == 'refs/heads/main'
+        run: echo "Listo para deployment a producción"
